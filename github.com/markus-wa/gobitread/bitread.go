@@ -1,16 +1,17 @@
 // Package bitread provides a bit level reader.
 package bitread
 
-// TODO: len(BitReader.buffer) must be a multiple of 4 and > 8 for the BitReader to work, this shouldn't be necessary?
+// TODO: len(BitReader.buffer) must be a multiple of 'sled' and > 2*'sled' for the BitReader to work, this shouldn't be necessary?
 
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
 const (
-	sled     = 4
+	sled     = 8
 	sledMask = sled - 1
 	sledBits = sled << 3
 )
@@ -59,20 +60,20 @@ func (r *BitReader) ActualPosition() int {
 }
 
 // Open sets the underlying io.Reader and internal buffer, making the reader ready to use.
-// bufferSize is in bytes, must be a multiple of 4 and > 8.
+// bufferSize is in bytes, must be a multiple of 8 and > 16.
 func (r *BitReader) Open(underlying io.Reader, bufferSize int) {
 	r.OpenWithBuffer(underlying, make([]byte, bufferSize))
 }
 
 // OpenWithBuffer is like Open but allows to provide the internal byte buffer.
 // Could be useful to pool buffers of short living BitReaders for example.
-// len(buffer) must be a multiple of 4 and > 8.
+// len(buffer) must be a multiple of 8 and > 16.
 func (r *BitReader) OpenWithBuffer(underlying io.Reader, buffer []byte) {
 	if len(buffer)&sledMask != 0 {
-		panic("Buffer must be a multiple of " + string(sled))
+		panic(fmt.Sprintf("Buffer must be a multiple of %d", sled))
 	}
 	if len(buffer) <= sled<<1 {
-		panic("Buffer must be larger than " + string(sled<<1) + " bytes")
+		panic(fmt.Sprintf("Buffer must be larger than %d bytes", sled<<1))
 	}
 
 	r.endReached = false
@@ -110,10 +111,10 @@ func (r *BitReader) ReadBit() bool {
 }
 
 // ReadBits reads n bits into a []byte.
-func (r *BitReader) ReadBits(n uint) []byte {
+func (r *BitReader) ReadBits(n int) []byte {
 	b := make([]byte, (n+7)>>3)
 	bitLevel := r.offset&7 != 0
-	for i := uint(0); i < n>>3; i++ {
+	for i := 0; i < n>>3; i++ {
 		b[i] = r.readByteInternal(bitLevel)
 	}
 	if n&7 != 0 {
@@ -139,15 +140,15 @@ func (r *BitReader) readByteInternal(bitLevel bool) byte {
 
 // ReadBitsToByte reads n bits into a byte.
 // Undefined for n > 8.
-func (r *BitReader) ReadBitsToByte(n uint) byte {
+func (r *BitReader) ReadBitsToByte(n int) byte {
 	return byte(r.ReadInt(n))
 }
 
 // ReadInt reads the next n bits as an int.
 // Undefined for n > 32.
-func (r *BitReader) ReadInt(n uint) uint {
+func (r *BitReader) ReadInt(n int) uint {
 	val := binary.LittleEndian.Uint64(r.buffer[r.offset>>3&^3:])
-	res := uint(val << (64 - (uint(r.offset) & 31) - n) >> (64 - n))
+	res := uint(val << uint(64-(r.offset&31)-n) >> (64 - uint(n)))
 	// Advance after using offset!
 	r.advance(n)
 	return res
@@ -168,7 +169,7 @@ func (r *BitReader) ReadBytesInto(out *[]byte, n int) {
 	if !bitLevel && r.offset+(n<<3) <= r.bitsInBuffer {
 		// Shortcut if offset%8 = 0 and all bytes are already buffered
 		*out = append(*out, r.buffer[r.offset>>3:(r.offset>>3)+n]...)
-		r.advance(uint(n) << 3)
+		r.advance(n << 3)
 	} else {
 		for i := 0; i < n; i++ {
 			*out = append(*out, r.readByteInternal(bitLevel))
@@ -189,10 +190,10 @@ func (r *BitReader) ReadCString(n int) string {
 
 // ReadSignedInt is like ReadInt but returns signed int.
 // Undefined for n > 32.
-func (r *BitReader) ReadSignedInt(n uint) int {
+func (r *BitReader) ReadSignedInt(n int) int {
 	val := binary.LittleEndian.Uint64(r.buffer[r.offset>>3&^3:])
 	// Cast to int64 before right shift & use offset before advance
-	res := int(int64(val<<(64-(uint(r.offset)&31)-n)) >> (64 - n))
+	res := int(int64(val<<uint(64-(r.offset&31)-n)) >> (64 - uint(n)))
 	r.advance(n)
 	return res
 }
@@ -213,31 +214,10 @@ func (r *BitReader) EndChunk() {
 	if delta < 0 {
 		panic("Someone read beyond a chunk boundary, what a dick")
 	} else if delta > 0 {
-		// Seek for the end of the chunk
-		bufferBits := r.bitsInBuffer - r.offset
-		seeker, ok := r.underlying.(io.Seeker)
-		if delta > bufferBits+sledBits && ok {
-			// Seek with io.Seeker
-			unbufferedSkipBits := delta - bufferBits
-			seeker.Seek(int64((unbufferedSkipBits>>3)-sled), io.SeekCurrent)
-
-			newBytes, _ := r.underlying.Read(r.buffer)
-
-			r.bitsInBuffer = (newBytes << 3) - sledBits
-			if newBytes <= sled {
-				// TODO: Maybe do this even if newBytes is <= bufferSize - sled like in refillBuffer
-				// Consume sled
-				// Shouldn't really happen unless we reached the end of the stream
-				// In that case bitsInBuffer should be 0 after this line (newBytes=0 - sled + sled)
-				r.bitsInBuffer += sledBits
-			}
-
-			r.offset = unbufferedSkipBits & 7
-			r.lazyPosition = target - r.offset
-		} else {
-			// Can't seek or no seek necessary
-			r.advance(uint(delta))
-		}
+		r.Skip(delta)
+	}
+	if target != r.ActualPosition() {
+		panic(fmt.Sprintf("Skipping data failed, expected position %d got %d", target, r.ActualPosition()))
 	}
 }
 
@@ -246,20 +226,45 @@ func (r *BitReader) ChunkFinished() bool {
 	return r.chunkTargets.top() <= r.ActualPosition()
 }
 
-func (r *BitReader) advance(bits uint) {
-	r.offset += int(bits)
-	if r.offset >= r.bitsInBuffer {
-		if r.endReached {
-			// As long as we stay in bounds this should be ok, just don't refill
-
-			if r.offset > r.bitsInBuffer {
-				// Read beyond end of underlying Reader
-				panic(io.ErrUnexpectedEOF)
-			}
-		} else {
-			// Refill if we reached the sled
-			r.refillBuffer()
+// Skip skips n bits.
+func (r *BitReader) Skip(n int) {
+	// Seek for the end of the chunk
+	bufferBits := r.bitsInBuffer - r.offset
+	seeker, ok := r.underlying.(io.Seeker)
+	if n > bufferBits+sledBits && ok {
+		// Seek with io.Seeker
+		unbufferedSkipBits := n - bufferBits
+		globalOffset, err := seeker.Seek(int64((unbufferedSkipBits>>3)-sled), io.SeekCurrent)
+		if err != nil {
+			panic(err)
 		}
+		r.lazyPosition = int(globalOffset) << 3
+
+		newBytes, err := r.underlying.Read(r.buffer)
+		if err != nil {
+			panic(err)
+		}
+		r.offset = unbufferedSkipBits & sledMask
+
+		r.bitsInBuffer = (newBytes << 3) - sledBits
+		if newBytes <= sled {
+			// TODO: Maybe do this even if newBytes is <= bufferSize - sled like in refillBuffer
+			// Consume sled
+			// Shouldn't really happen unless we reached the end of the stream
+			// In that case bitsInBuffer should be 0 after this line (newBytes=0 - sled + sled)
+			r.bitsInBuffer += sledBits
+		}
+	} else {
+		// Can't seek or no seek necessary
+		r.advance(n)
+	}
+}
+
+func (r *BitReader) advance(bits int) {
+	r.offset += bits
+	for r.offset > r.bitsInBuffer {
+		// Refill if we reached the sled
+		r.refillBuffer()
 	}
 }
 
@@ -277,6 +282,10 @@ func (r *BitReader) refillBuffer() {
 
 	r.bitsInBuffer = newBytes << 3
 	if newBytes < len(r.buffer)-(sled<<1) {
+		if r.endReached {
+			// Read beyond end of underlying Reader
+			panic(io.ErrUnexpectedEOF)
+		}
 		// We're done here, consume sled
 		r.bitsInBuffer += sledBits
 		r.endReached = true
